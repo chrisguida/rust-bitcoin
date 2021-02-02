@@ -124,7 +124,7 @@ impl BlockFilter {
 
     /// Compute a SCRIPT_FILTER that contains spent and output scripts
     pub fn new_script_filter<M>(block: &Block, script_for_coin: M) -> Result<BlockFilter, Error>
-        where M: Fn(&OutPoint) -> Result<Script, Error> {
+        where M: FnMut(&OutPoint) -> Result<Script, Error> {
         let mut out = Cursor::new(Vec::new());
         {
             let mut writer = BlockFilterWriter::new(&mut out, block);
@@ -177,7 +177,7 @@ impl<'a> BlockFilterWriter<'a> {
 
     /// Add consumed output scripts of a block to filter
     pub fn add_input_scripts<M>(&mut self, script_for_coin: M) -> Result<(), Error>
-        where M: Fn(&OutPoint) -> Result<Script, Error> {
+        where M: FnMut(&OutPoint) -> Result<Script, Error> {
         for script in self.block.txdata.iter()
             .skip(1) // skip coinbase
             .flat_map(|t| t.input.iter().map(|i| &i.previous_output))

@@ -35,14 +35,16 @@ use std::io::{Cursor, Read, Write};
 use hashes::hex::ToHex;
 
 use hashes::{sha256d, Hash};
-use hash_types::{BlockHash, FilterHash, TxMerkleNode, FilterHeader};
+use hash_types::{BlockHash, FilterHash, TxMerkleNode, FilterHeader, PubkeyHash, ScriptHash};
 
 use util::endian;
 use util::psbt;
 
-use blockdata::transaction::{TxOut, Transaction, TxIn};
+use blockdata::{transaction::{TxOut, Transaction, TxIn}, undo::{TxUndo, TxOutUndo}, script::Builder};
 use network::message_blockdata::Inventory;
 use network::address::{Address, AddrV2Message};
+
+use crate::{PublicKey, Script};
 
 /// Encoding error
 #[derive(Debug)]
@@ -321,13 +323,25 @@ pub trait Decodable: Sized {
     fn consensus_decode<D: io::Read>(d: D) -> Result<Self, Error>;
 }
 
-/// A variable-length unsigned integer
+/// A variable-length unsigned integer (aka CompactSize in bitcoin core)
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct VarInt(pub u64);
+
+/// Another variable-length unsigned integer (aka VARINT in bitcoin core)
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+pub struct VarInt2(pub u64);
+
+/// A variable-length encoding for compressing satoshi amounts (aka CompressedAmount in bitcoin core)
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+pub struct CompressedAmount(pub u64);
 
 /// Data which must be preceded by a 4-byte checksum
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct CheckedData(pub Vec<u8>);
+
+#[derive(Clone, Default, PartialOrd, Ord, PartialEq, Eq, Hash, Debug)]
+/// A Compressed Bitcoin script
+pub struct CompressedScript(pub Script);
 
 // Primitive types
 macro_rules! impl_int_encodable{
@@ -433,6 +447,82 @@ impl Decodable for VarInt {
             }
             n => Ok(VarInt(n as u64))
         }
+    }
+}
+
+impl VarInt2 {
+    /// Gets the length of this VarInt2 when encoded. (TODO)
+    #[inline]
+    pub fn len(&self) -> usize {
+        todo!();
+    }
+}
+
+// impl Encodable for VarInt2 {
+//     #[inline]
+//     fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, Error> {
+//         todo!();
+//     }
+// }
+
+impl Decodable for VarInt2 {
+    #[inline]
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, Error> {
+        let mut n = 0;
+        loop {
+            let ch_data = d.read_u8()?;
+            if n > usize::max_value() >> 7 {
+                panic!("size too large");
+            }
+            n = (n << 7) | (ch_data & 0x7F) as usize;
+            if ch_data & 0x80 > 0 {
+                if n == usize::max_value() {
+                    panic!("size too large");
+                }
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(VarInt2(n as u64))
+    }
+}
+
+impl CompressedAmount {
+    /// Gets the length of this CompressedAmount when encoded. (TODO)
+    #[inline]
+    pub fn len(&self) -> usize {
+        todo!();
+    }
+}
+
+// impl Encodable for CompressedAmount {
+//     #[inline]
+//     fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, Error> {
+//         todo!();
+//     }
+// }
+
+impl Decodable for CompressedAmount {
+    #[inline]
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, Error> {
+        let mut n = 0;
+        loop {
+            let ch_data = d.read_u8()?;
+            if n > usize::max_value() >> 7 {
+                panic!("size too large");
+            }
+            n = (n << 7) | (ch_data & 0x7F) as usize;
+            if ch_data & 0x80 > 0 {
+                if n == usize::max_value() {
+                    panic!("size too large");
+                }
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(CompressedAmount(n as u64))
     }
 }
 
@@ -587,7 +677,9 @@ impl_vec!(FilterHash);
 impl_vec!(FilterHeader);
 impl_vec!(TxMerkleNode);
 impl_vec!(Transaction);
+impl_vec!(TxUndo);
 impl_vec!(TxOut);
+impl_vec!(TxOutUndo);
 impl_vec!(TxIn);
 impl_vec!(Inventory);
 impl_vec!(Vec<u8>);
@@ -678,6 +770,70 @@ impl Decodable for CheckedData {
         }
     }
 }
+
+
+impl CompressedScript {
+    #[inline]
+    fn consensus_decompress(sl: &[u8], n_size: usize) -> Result<Script, Error> {
+        // println!("calling new_p2pk with {:?}", &[&[n_size as u8][..], sl].concat());
+        // println!("called consensus_decompress with sl {:?} and n_size {:?}", sl, n_size);
+        match n_size {
+            0 => Ok(Script::new_p2pkh(&PubkeyHash::from_slice(sl).unwrap())),
+            1 => Ok(Script::new_p2sh(&ScriptHash::from_slice(sl).unwrap())),
+            2..=5 => {
+                let first_byte: u8 = match n_size {
+                    2|3 => n_size as u8,
+                    _ => (n_size - 2) as u8,
+                };
+                let mut public_key = match PublicKey::from_slice(&[&[first_byte][..], sl].concat()) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        println!("calling new_p2pk with {:?}", &[&[(n_size-2) as u8][..], sl].concat());
+                        println!("called consensus_decompress with sl {:?} and n_size {:?}", sl, n_size);
+                        eprintln!("error encountered: {}" , e);
+                        panic!();
+                    }
+                };
+                if n_size == 4 || n_size == 5 {
+                    public_key.compressed = false;
+                }
+                Ok(Script::new_p2pk(&public_key))
+            },
+            _ => Ok(Builder::new().push_slice(sl).into_script()),
+        }
+    }
+}
+
+
+// Compressed scripts, as stored on disk in the undo files
+impl Encodable for CompressedScript {
+    #[inline]
+    fn consensus_encode<S: io::Write>(&self, s: S) -> Result<usize, Error> {
+        Ok(self.0.consensus_encode(s)?)
+    }
+}
+
+impl Decodable for CompressedScript {
+    #[inline]
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<CompressedScript, Error> {
+        let script_len_code = VarInt2::consensus_decode(&mut d)?.0 as usize;
+        // println!("script_len_code = {}", script_len_code);
+        let script_len = match script_len_code {
+            0 | 1 => 20,
+            2..=5 => 32,
+            _ => script_len_code - 6
+        };
+        let mut script_pubkey_buf = vec![0u8; script_len as usize];
+        d.read_slice(&mut script_pubkey_buf[..]).ok();
+        // let script_pubkey = d.read_exact(script_pubkey_buf, script_len as u32)?;
+        // panic!();
+        Ok(CompressedScript {
+            0: CompressedScript::consensus_decompress(&script_pubkey_buf, script_len_code).unwrap()
+        })
+    }
+
+}
+
 
 // Tuples
 macro_rules! tuple_encode {
